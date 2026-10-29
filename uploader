@@ -1,0 +1,159 @@
+import asyncio
+import os
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, FSInputFile
+from aiogram.filters import Command
+from aiogram.exceptions import TelegramRetryAfter
+
+
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    chat_id: str
+
+    @classmethod
+    def load(cls) -> "Config":
+        load_dotenv()
+        token = os.getenv("Bot_token")
+        chat_id = os.getenv("Chat_id")
+
+        if not token:
+            raise RuntimeError("Bot_token is missing in .env")
+        if not chat_id:
+            raise RuntimeError("Chat_id is missing in .env")
+
+        return cls(bot_token=token, chat_id=chat_id)
+
+
+class MusicStorage:
+    def __init__(self):
+        self.base_dir = Path(__file__).resolve().parent
+        self.music_dir = self.base_dir / "music"
+        self.log_file = self.base_dir / "conversations.json"
+        self.audio_extensions = {".mp3", ".m4a"}
+        self._lock = asyncio.Lock()
+
+    def load_file(self):
+        if not self.log_file.exists():
+            return []
+        try:
+            with open(self.log_file, "r", encoding="utf-8") as file:
+                return json.load(file)
+        except json.JSONDecodeError:
+            print(f"[storage] {self.log_file.name} is corrupted")
+            return []
+
+    def save_files(self, data):
+        tmp = self.log_file.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=4)
+        tmp.replace(self.log_file)
+
+    async def register(self, file_name, on_new):
+        async with self._lock:
+            existing = self.load_file()
+            if file_name in existing:
+                return False
+
+            await on_new()
+            existing.append(file_name)
+            self.save_files(existing)
+            return True
+
+    def iter_audio_files(self):
+        if not self.music_dir.exists():
+            return
+        for path in self.music_dir.iterdir():
+            if path.is_file() and path.suffix in self.audio_extensions:
+                yield path
+
+
+class ThankTimerManager:
+    def __init__(self):
+        self._task = {}
+
+    def reset(self, user_id, callback):
+        old = self._task.get(user_id)
+        if old:
+            old.cancel()
+        task = asyncio.create_task(self._run(user_id, callback))
+        self._task[user_id] = task
+
+    async def _run(self, user_id, callback):
+        try:
+            await asyncio.sleep(90)
+            await callback()
+        finally:
+            self._task.pop(user_id, None)
+
+
+class MusicBot:
+    def __init__(self, config: Config):
+        self.config = config
+        self.storage = MusicStorage()
+        self.timer = ThankTimerManager()
+
+        self.bot = Bot(token=config.bot_token)
+        self.dp = Dispatcher()
+        self.router = Router()
+
+        self._register_handlers()
+        self.dp.include_router(self.router)
+
+    def _register_handlers(self):
+        self.router.message(F.audio)(self._on_audio)
+        self.router.message(Command("upload"))(self._on_upload)
+
+    async def run(self):
+        print("start...")
+        await self.dp.start_polling(self.bot)
+
+    async def _on_audio(self, message: Message):
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        file_id = message.audio.file_id
+        file_name = Path(message.audio.file_name or f"{file_id}.mp3").name
+
+        self.storage.music_dir.mkdir(exist_ok=True)
+
+        async def download():
+            file = await self.bot.get_file(file_id)
+            await self.bot.download_file(
+                file.file_path,
+                destination=self.storage.music_dir / file_name
+            )
+
+        await self.storage.register(file_name, download)
+
+        async def say_thank():
+            await self.bot.send_message(chat_id=chat_id, text="thank for using!")
+
+        self.timer.reset(user_id, say_thank)
+
+    async def _on_upload(self, message: Message):
+        for path in self.storage.iter_audio_files():
+            document = FSInputFile(path)
+            while True:
+                try:
+                    await self.bot.send_document(
+                        chat_id=self.config.chat_id,
+                        document=document
+                    )
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+
+
+async def main():
+    config = Config.load()
+    bot = MusicBot(config)
+    await bot.run()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
